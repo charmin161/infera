@@ -663,8 +663,121 @@ DeepInfer Attention-DP4 / EP4 / CP1
 4. 对 indexer 的修改，是否改变了最终选中的 token/index；
 5. 修改后的 acceptance 与输出质量是否变化。
 
+
 特别是 indexer：从数值分析角度看，score 的舍入和并列值处理可能影响 top-k 边界。只比较 GEMM 输出误差，不一定能发现稀疏选择已经改变。
 
 **对你现在的目标，我建议把新版 SGLang 作为“共享高性能 kernel 已接入通用服务框架”的对照，把 DeepInfer 作为“原生模型执行流程”的对照。**两边共同使用 FlashMLA、DeepGEMM 等组件，适合比较这些算子的调用形状与上下游开销；Engram、DSpark glue、graph 和调度则要作为独立差异分析。这样抓到的 profiler 才能回答：速度究竟来自算子更快、工作量更少，还是算子之间的等待更少。
 
 
+
+**和 DeepSeek 的开源算子栈有关的升级很多；但能明确归因于“这次 DeepInfer 引擎开源”的升级，要少得多。**
+
+上一条列的是 **V4.1 的同期优化清单**，不能把整张清单都算成 DeepInfer 开源带来的成果。重新核对后，应该分成三类：
+
+1. **接入 DeepSeek 独立算子库**：MegaAttention、MegaMoE、Mega-mHC、MegaGate、DeepSelect。这些与 DeepInfer 使用同一套底层技术，但不少在引擎公开之前就已进入 SGLang。
+2. **明确参考 DeepInfer 引擎源码**：本次查到证据最明确的是 **DSpark 在线成本反馈**、**大 prefill 的 mHC 直写 MegaMoE buffer**，但截至 **2026 年 11 月 2 日，两项仍未合入**。
+3. **SGLang 已有能力或自身适配优化**：例如 overlap scheduler、已有的 SWA replay、Engram placement，以及部分 graph/metadata 优化，不能统一归因于 DeepInfer 开源。
+
+## 1. 已经落地、关联最明确的：复用 DeepSeek 算子库
+
+以 DeepInfer 公开仓库的 [initial commit（10 月 20 日）](https://github.com/deepseek-ai/DeepInfer/commit/d585e6542c0571176272d703f03c4807ae901284) 为时间参照，下面几项的关系很清楚。表中日期均为北京时间。
+
+| SGLang 升级 | 直接依赖的技术 | 进入 SGLang main 的时间 | 应该怎样归因 |
+|---|---|---|---|
+| **MegaAttention + NVFP4 KV** | **FlashMLA** 的融合 attention | **10 月 16 日**，[#43922](https://github.com/sgl-project/sglang/pull/43922) | 接入 DeepSeek 的 attention kernel；早于 DeepInfer 初始提交 |
+| **V4.1 的 DP attention + MegaMoE 适配** | **DeepGEMM** MegaMoE | **10 月 11 日**，[#43228](https://github.com/sgl-project/sglang/pull/43228) | 扩展已有 MegaMoE 支持，处理 V4.1 的形状、路由、idle rank 等；并非首次引入 MegaMoE |
+| **Mega-mHC 接入** | **DeepGEMM** 的融合 mHC | **10 月 11 日**，[#42808](https://github.com/sgl-project/sglang/pull/42808) | 采用 DeepSeek 的融合算子能力，早于 DeepInfer 初始提交 |
+| **DeepSelect top-k、BF16 indexer 优化** | **DeepSelect / DeepGEMM**，加上 SGLang 的 kernel 优化 | **10 月 15 日**，[#44051](https://github.com/sgl-project/sglang/pull/44051) | 属于底层算子接入和优化，早于 DeepInfer 初始提交 |
+| **MegaGate routing** | **DeepGEMM `bf16_mega_gate`** | **10 月 23 日**，[#43262](https://github.com/sgl-project/sglang/pull/43262) | 虽然合入较晚，但 PR 在 **10 月 9 日**就已创建，属于此前已开始的 DeepGEMM 集成 |
+| **Mega-mHC 直接写 MegaMoE 输入，decode/verify 路径** | 利用 **DeepGEMM `mega_mhc`** 已有的 FP8 与 scale 输出接口 | **10 月 24 日**，[#46163](https://github.com/sgl-project/sglang/pull/46163) | 可以确认是 DeepSeek 算子能力上的 SGLang 集成优化；PR 没有明确声称移植自 DeepInfer |
+
+这里最关键的区别是：
+
+> **SGLang 和 DeepInfer 都调用 FlashMLA/DeepGEMM，不足以说明 SGLang 的实现来自 DeepInfer。它们也可能分别接入同一个独立算子库。**
+
+例如，MegaGate 的 PR 直接描述了它使用 DeepGEMM 的 `bf16_mega_gate`，将 gate GEMM、专家选择和 routing 写入融合，并对接 SGLang 自己的 buffer、EPLB 和 padding。这个归因是明确的。
+
+DeepSelect 的 PR 甚至包含 SGLang 侧对 cluster top-k kernel 的重写与优化，也不能简单概括为“从 DeepInfer 搬过来”。[GitHub](https://github.com/sgl-project/sglang/pull/44051?utm_source=chatgpt.com)
+
+## 2. 明确参考 DeepInfer 引擎的：目前最强的两条证据
+
+### 2.1 DSpark 在线延迟成本校正：#45536
+
+这个 [PR #45536](https://github.com/sgl-project/sglang/pull/45536) 明确写道：
+
+> “Inspired by DeepInfer’s runtime cost feedback”
+
+它链接的是 DeepInfer 的 [`csrc/engine/mtp_varlen.hpp`](https://github.com/deepseek-ai/DeepInfer/blob/8b16149741a4935e1dec8cea27853f273b374c5b/csrc/engine/mtp_varlen.hpp)。
+
+**借鉴的内容是什么？**
+
+SGLang 原本已经有 DSpark 的置信度和验证预算决策，但决策需要估计：“验证这么多 token，大概要花多少时间？”
+
+初始估计可以来自离线 profiling。实际运行时，上下文长度、batch 和负载变化后，离线估计可能不再准确。这个改动把**已经完成的 step 的实测耗时反馈回来，修正后续的验证成本估计**。
+
+因此，这里新增的是：
+
+**实际 step 延迟 → 校正成本估计 → 改善下一步验证预算。**
+
+它复用了 SGLang 自己的执行周期和成本统计基础，并没有直接搬入 DeepInfer 的整个 C++ scheduler，也不涉及重新训练 DSpark。
+
+**截至 11 月 2 日：仍是 Open + Draft，性能验证尚未完成，不能计入已发布版本的提速。**
+
+### 2.2 大 prefill 的 mHC 直接写 MegaMoE buffer：#46056
+
+这个 [PR #46056](https://github.com/sgl-project/sglang/pull/46056) 明确写道：
+
+> “Adapted from the producer/buffer boundary in DeepInfer”
+
+它引用 DeepInfer 的 [`v4_modules/hc.py`](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/models/v4_modules/hc.py)。
+
+**借鉴的内容是什么？**
+
+核心是让相邻算子的输入输出接口直接衔接：
+
+| 处理方式 | 数据如何流动 |
+|---|---|
+| 原有路径 | mHC 先生成中间激活和 scale，再整理或搬到 MegaMoE 的输入 buffer |
+| 新路径 | mHC 直接把量化激活和 scale 写进 MegaMoE 已分配的 buffer |
+
+这样有机会省掉一次中间数据搬运及相关处理。
+
+它针对的是 **大尺寸 eager prefill**，当前条件包括 SM10x、至少 16,384 行等。
+
+**截至 11 月 2 日：仍然 Open，尚未合入。**
+
+这里尤其要区分两个容易混在一起的 PR：
+
+- **#46163：已合入，主要覆盖 MegaGate decode/target-verify。**
+- **#46056：未合入，扩展到大 eager prefill，明确注明参考 DeepInfer。**
+
+不能把 #46056 的来源声明，自动套到 #46163 身上。
+
+### 2.3 还有一种关系：把 DeepInfer 当作格式参考
+
+[#45851](https://github.com/sgl-project/sglang/pull/45851) 用模型 reference 和 DeepInfer 的 `V41_FORMAT` 共同确认 KV cache 格式，再通过 **FlashInfer** 支持 SM120/SM121 上的相应读取路径。
+
+这属于**格式和正确性参照**，不是移植 DeepInfer 的 attention kernel。该 PR 目前也未合入，而且目标是 SM120/121，不是你的 B200 所属的 SM100。[GitHub](https://github.com/sgl-project/sglang/pull/45851?utm_source=chatgpt.com)
+
+## 3. 上一条提到的哪些优化，不应该直接归因于 DeepInfer 开源？
+
+| 功能或升级 | 公开证据支持的归因 |
+|---|---|
+| **SWA bounded replay 基础能力** | SGLang 官方说明，从支持 V4.1 的第一天就已有 |
+| **Engram 表放在 host memory** | 官方同样说明，从 V4.1 支持第一天就已有 |
+| **CPU/GPU overlap scheduler** | SGLang 从 **2024 年 12 月 v0.4** 就有；DeepInfer 的文档反过来认可了这一设计 |
+| **DSpark 图间 metadata、accept、KV commit 优化 #45450** | PR 的明确动机是 NVIDIA megakernel 路径缩短 GPU 时间后，SGLang 的 host 工作成为瓶颈；没有明确写成参考 DeepInfer |
+| **Engram GPU peer-read #46180** | SGLang 自己通过 CUDA VMM 映射和 Triton gather 直接读其他 GPU 的表分片；与 DeepInfer 的 EngramBuffer 数据路径不同 |
+| **Breakable prefill graph 与 replay 配合** | 相关 [#43736](https://github.com/sgl-project/sglang/pull/43736)、[#43733](https://github.com/sgl-project/sglang/pull/43733) 已分别在 **10 月 14 日、19 日**合入 |
+
+前三项有 SGLang 官方文章的明确历史说明。[LMSYS Org](https://www.lmsys.org/blog/2026-10-24-dsv41-deepinfer/?utm_source=chatgpt.com) 后两类执行优化可直接看 [DSpark #45450](https://github.com/sgl-project/sglang/pull/45450) 和 [Engram peer-read #46180](https://github.com/sgl-project/sglang/pull/46180) 的动机与实现描述。
+
+这里的判断是**没有找到足够证据确认直接来源**，并不是断言开发者绝对没有受到 DeepInfer 启发。仅凭“在开源之后合入”或“功能看起来相似”，无法建立这种因果关系。
+
+## 4. 这次 DeepInfer 开源额外带来的价值是什么？
+
+除了独立 kernel，DeepInfer 还公开了**这些 kernel 在完整推理流程中怎样组织起来**：相邻算子的 buffer 如何衔接、验证预算如何决策、实际执行成本如何反馈，以及模型格式和运行行为如何对照。上面的 #45536、#46056 就是具体例子。
+
+它也提供了一个可执行的性能参考。SGLang 的官方文章确实使用 DeepInfer 的 workload 和引擎进行对照测试；但这证明的是“可以对标原生引擎并继续优化”，不能反推文章里列出的所有能力都因这次开源才出现。[LMSYS Org](https://www.lmsys.org/blog/2026-10-24-dsv41-deepinfer/?utm_source=chatgpt.com)
+
+**所以，对已经落地的这批升级，最准确的表述是“持续接入 DeepSeek 的算子生态，并优化 SGLang 自己的执行流程”；对明确引用 DeepInfer 的部分，则应逐项写成“参考其运行时设计”，同时标注是否已经合入。**
